@@ -1,70 +1,64 @@
-// png-squeeze-01: squeeze 1280x720 RGBA screenshots into the smallest lossless PNG.
-// Pipeline: decode the stored PNG, reduce the colour type (palette / grey /
-// RGB(A) with a tRNS key where it holds the image exactly), choose filters per
-// row from a small set of strategies screened by zlib, then compress the
-// filtered data with an own optimal-parsing DEFLATE (hash-chain LZ77 +
-// shortest-path parse + dynamic Huffman, in the manner of zopfli).
-// Deterministic: every choice is a function of the input bytes only, budgeted
-// by fixed work counts, never by the wall clock. Node 22, built-ins only.
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+// png-squeeze: squeeze 1280x720 RGBA screenshots into the smallest lossless PNG.
+//
+// Own implementation, written from the competition spec: a PNG decoder, a
+// per-instance colour-type reduction, a filter screening pass, and an
+// optimal-parsing DEFLATE encoder (hash-chain LZ77, three-pass shortest-path
+// parse, length-limited dynamic Huffman). Each instance's filtered stream is
+// encoded twice — once by the own parser and once by the platform zlib at
+// level 9 — and the smaller raw DEFLATE stream is kept. Node 22+,
+// built-ins only, no network, no wall-clock reads: every choice is a
+// function of the input bytes and fixed work budgets, so two runs write
+// identical bytes.
+//
+// Usage: node main.ts — reads /input/<id>/image.png for i001..i008 and writes
+// /output/<id>/image.png. MAKEFUN_INPUT_DIR / MAKEFUN_OUTPUT_DIR override the
+// directories for local runs.
 import { deflateSync, inflateSync } from 'node:zlib';
-
-const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-const WIDTH = 1280;
-const HEIGHT = 720;
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 // ---------------------------------------------------------------------------
-// PNG container: CRC-32, chunk assembly, decoding.
+// Checksums
 // ---------------------------------------------------------------------------
+
 const CRC_TABLE: Int32Array = (() => {
-  const t = new Int32Array(256);
+  const table = new Int32Array(256);
   for (let n = 0; n < 256; n++) {
     let c = n;
-    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    t[n] = c;
+    for (let k = 0; k < 8; k++) c = (c & 1) !== 0 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c;
   }
-  return t;
+  return table;
 })();
 
-function crc32(bytes: Uint8Array, start = 0, end = bytes.length): number {
+function crc32(bytes: Uint8Array, start: number, end: number): number {
   let c = -1;
   for (let i = start; i < end; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
   return (c ^ -1) >>> 0;
 }
 
-const PNG_SIG = Uint8Array.of(137, 80, 78, 71, 13, 10, 26, 10);
-const ASCII = (s: string): Uint8Array => Uint8Array.from(s, (ch) => ch.charCodeAt(0));
-
-function pngOf(chunks: [string, Uint8Array][]): Uint8Array {
-  let size = PNG_SIG.length;
-  for (const [, data] of chunks) size += 12 + data.length;
-  const out = new Uint8Array(size);
-  const view = new DataView(out.buffer);
-  out.set(PNG_SIG, 0);
-  let at = PNG_SIG.length;
-  for (const [type, data] of chunks) {
-    view.setUint32(at, data.length);
-    out.set(ASCII(type), at + 4);
-    out.set(data, at + 8);
-    view.setUint32(at + 8 + data.length, crc32(out, at + 4, at + 8 + data.length));
-    at += 12 + data.length;
+function adler32(bytes: Uint8Array): number {
+  let a = 1;
+  let b = 0;
+  let i = 0;
+  while (i < bytes.length) {
+    const end = Math.min(bytes.length, i + 5552);
+    for (; i < end; i++) {
+      a += bytes[i];
+      b += a;
+    }
+    a %= 65521;
+    b %= 65521;
   }
-  return out;
+  return ((b << 16) | a) >>> 0;
 }
 
-function ihdrOf(width: number, height: number, colourType: number): Uint8Array {
-  const d = new Uint8Array(13);
-  const v = new DataView(d.buffer);
-  v.setUint32(0, width);
-  v.setUint32(4, height);
-  d[8] = 8;
-  d[9] = colourType;
-  return d;
-}
+// ---------------------------------------------------------------------------
+// PNG decoding (8-bit, colour types 0/2/3/4/6)
+// ---------------------------------------------------------------------------
 
 const CHANNELS: Record<number, number> = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 };
+const PNG_SIGNATURE = [137, 80, 78, 71, 13, 10, 26, 10];
 
 function paeth(a: number, b: number, c: number): number {
   const p = a + b - c;
@@ -75,60 +69,81 @@ function paeth(a: number, b: number, c: number): number {
   return pb <= pc ? b : c;
 }
 
-/** Decode a PNG file to RGBA (4 bytes a pixel). Supports colour types 0, 2, 3, 4, 6 at bit depth 8. */
-function decodePng(bytes: Uint8Array): { width: number; height: number; rgba: Uint8Array } {
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  let at = PNG_SIG.length;
+interface DecodedImage {
+  width: number;
+  height: number;
+  rgba: Uint8Array;
+}
+
+function decodePng(file: Uint8Array): DecodedImage {
+  for (let i = 0; i < 8; i++) {
+    if (file[i] !== PNG_SIGNATURE[i]) throw new Error('input is not a PNG');
+  }
+  const view = new DataView(file.buffer, file.byteOffset, file.byteLength);
+  let at = 8;
   let width = 0;
   let height = 0;
   let colourType = 6;
   let palette: Uint8Array | null = null;
   let trns: Uint8Array | null = null;
-  const idat: Uint8Array[] = [];
-  while (at < bytes.length) {
+  const idatParts: Uint8Array[] = [];
+  while (at < file.length) {
     const len = view.getUint32(at);
-    const type = String.fromCharCode(bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7]);
-    const data = bytes.subarray(at + 8, at + 8 + len);
+    const type = String.fromCharCode(file[at + 4], file[at + 5], file[at + 6], file[at + 7]);
+    const data = file.subarray(at + 8, at + 8 + len);
     at += 12 + len;
     if (type === 'IHDR') {
-      const dv = new DataView(data.buffer, data.byteOffset, 13);
+      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
       width = dv.getUint32(0);
       height = dv.getUint32(4);
+      if (data[8] !== 8) throw new Error('input bit depth is not 8');
       colourType = data[9];
+      if (!(colourType in CHANNELS)) throw new Error('input colour type not supported');
+      if (data[12] !== 0) throw new Error('input is interlaced');
     } else if (type === 'PLTE') {
       palette = data;
     } else if (type === 'tRNS') {
       trns = data;
     } else if (type === 'IDAT') {
-      idat.push(data);
+      idatParts.push(data);
     } else if (type === 'IEND') {
       break;
     }
   }
   const bpp = CHANNELS[colourType];
   const stride = width * bpp;
-  const raw = inflateSync(idat.length === 1 ? idat[0] : Buffer.concat(idat));
+  const raw = inflateSync(idatParts.length === 1 ? idatParts[0] : Buffer.concat(idatParts));
   const samples = new Uint8Array(height * stride);
   for (let y = 0; y < height; y++) {
-    const ft = raw[y * (stride + 1)];
+    const filter = raw[y * (stride + 1)];
     const src = y * (stride + 1) + 1;
     const o = y * stride;
-    const p = o - stride;
-    if (ft === 0) {
+    const up = o - stride;
+    if (filter === 0) {
       samples.set(raw.subarray(src, src + stride), o);
-    } else if (ft === 1) {
-      for (let i = 0; i < stride; i++) samples[o + i] = raw[src + i] + (i >= bpp ? samples[o + i - bpp] : 0);
-    } else if (ft === 2) {
-      for (let i = 0; i < stride; i++) samples[o + i] = raw[src + i] + (y > 0 ? samples[p + i] : 0);
-    } else if (ft === 3) {
-      for (let i = 0; i < stride; i++) samples[o + i] = raw[src + i] + (((i >= bpp ? samples[o + i - bpp] : 0) + (y > 0 ? samples[p + i] : 0)) >> 1);
-    } else {
+    } else if (filter === 1) {
       for (let i = 0; i < stride; i++) {
-        const a = i >= bpp ? samples[o + i - bpp] : 0;
-        const b = y > 0 ? samples[p + i] : 0;
-        const c = y > 0 && i >= bpp ? samples[p + i - bpp] : 0;
-        samples[o + i] = raw[src + i] + paeth(a, b, c);
+        samples[o + i] = raw[src + i] + (i >= bpp ? samples[o + i - bpp] : 0);
       }
+    } else if (filter === 2) {
+      for (let i = 0; i < stride; i++) {
+        samples[o + i] = raw[src + i] + (y > 0 ? samples[up + i] : 0);
+      }
+    } else if (filter === 3) {
+      for (let i = 0; i < stride; i++) {
+        const left = i >= bpp ? samples[o + i - bpp] : 0;
+        const above = y > 0 ? samples[up + i] : 0;
+        samples[o + i] = raw[src + i] + ((left + above) >> 1);
+      }
+    } else if (filter === 4) {
+      for (let i = 0; i < stride; i++) {
+        const left = i >= bpp ? samples[o + i - bpp] : 0;
+        const above = y > 0 ? samples[up + i] : 0;
+        const upperLeft = y > 0 && i >= bpp ? samples[up + i - bpp] : 0;
+        samples[o + i] = raw[src + i] + paeth(left, above, upperLeft);
+      }
+    } else {
+      throw new Error('input row has filter type ' + filter);
     }
   }
   const n = width * height;
@@ -147,12 +162,16 @@ function decodePng(bytes: Uint8Array): { width: number; height: number; rgba: Ui
     const key = trns === null ? -1 : trns[1];
     for (let i = 0, d = 0; i < n; i++, d += 4) {
       const g = samples[i];
-      rgba[d] = rgba[d + 1] = rgba[d + 2] = g;
+      rgba[d] = g;
+      rgba[d + 1] = g;
+      rgba[d + 2] = g;
       rgba[d + 3] = g === key ? 0 : 255;
     }
   } else if (colourType === 4) {
     for (let i = 0, s = 0, d = 0; i < n; i++, s += 2, d += 4) {
-      rgba[d] = rgba[d + 1] = rgba[d + 2] = samples[s];
+      rgba[d] = samples[s];
+      rgba[d + 1] = samples[s];
+      rgba[d + 2] = samples[s];
       rgba[d + 3] = samples[s + 1];
     }
   } else {
@@ -169,150 +188,115 @@ function decodePng(bytes: Uint8Array): { width: number; height: number; rgba: Ui
 }
 
 // ---------------------------------------------------------------------------
-// Image analysis: opaque / grey / colours (<=256) / single transparent key.
+// Colour-type reduction
 // ---------------------------------------------------------------------------
-type Colour = { rgba: [number, number, number, number]; word: number; count: number };
 
-function analyse(rgba: Uint8Array): { opaque: boolean; grey: boolean; colours: Colour[] | null } {
-  const n = rgba.length >>> 2;
-  const u32 = new Uint32Array(rgba.buffer, rgba.byteOffset, n);
-  let opaque = true;
-  let grey = true;
-  const counts = new Map<number, number>();
-  let many = false;
-  for (let i = 0, d = 0; i < n; i++, d += 4) {
-    if (rgba[d + 3] !== 255) opaque = false;
-    if (rgba[d] !== rgba[d + 1] || rgba[d] !== rgba[d + 2]) grey = false;
-    if (!many) {
-      const c = u32[i];
-      const k = counts.get(c);
-      if (k === undefined) {
-        if (counts.size === 256) many = true;
-        else counts.set(c, 1);
-      } else counts.set(c, k + 1);
-    }
-  }
-  let colours: Colour[] | null = null;
-  if (!many) {
-    colours = [...counts.keys()].map((c) => {
-      const b = new Uint8Array(Uint32Array.of(c).buffer);
-      return { rgba: [b[0], b[1], b[2], b[3]] as [number, number, number, number], word: c, count: counts.get(c) as number };
-    });
-  }
-  return { opaque, grey, colours };
-}
-
-/** The one fully transparent value the image may key by tRNS instead of an alpha channel. */
-function transparentKey(rgba: Uint8Array, grey: boolean): number | null {
-  let key = -1;
-  for (let d = 0; d < rgba.length; d += 4) {
-    const a = rgba[d + 3];
-    if (a === 255) continue;
-    if (a !== 0) return null;
-    const v = grey ? rgba[d] : (rgba[d] << 16) | (rgba[d + 1] << 8) | rgba[d + 2];
-    if (key === -1) key = v;
-    else if (key !== v) return null;
-  }
-  if (key === -1) return null;
-  for (let d = 0; d < rgba.length; d += 4) {
-    if (rgba[d + 3] !== 255) continue;
-    const v = grey ? rgba[d] : (rgba[d] << 16) | (rgba[d + 1] << 8) | rgba[d + 2];
-    if (v === key) return null;
-  }
-  return key;
-}
-
-function samplesOf(rgba: Uint8Array, ct: number): Uint8Array {
-  const n = rgba.length >>> 2;
-  if (ct === 6) return rgba;
-  const ch = ct === 0 ? 1 : ct === 4 ? 2 : 3;
-  const out = new Uint8Array(n * ch);
-  for (let i = 0, d = 0, s = 0; i < n; i++, d += 4, s += ch) {
-    if (ct === 0) out[s] = rgba[d];
-    else if (ct === 4) {
-      out[s] = rgba[d];
-      out[s + 1] = rgba[d + 3];
-    } else {
-      out[s] = rgba[d];
-      out[s + 1] = rgba[d + 1];
-      out[s + 2] = rgba[d + 2];
-    }
-  }
-  return out;
-}
-
-function paletteForm(rgba: Uint8Array, colours: Colour[], order: string): { plte: Uint8Array; trns: Uint8Array | null; indices: Uint8Array } {
-  const lum = (c: Colour): number => 299 * c.rgba[0] + 587 * c.rgba[1] + 114 * c.rgba[2];
-  const entries = [...colours].sort((x, y) => {
-    const ta = x.rgba[3] === 255 ? 1 : 0;
-    const tb = y.rgba[3] === 255 ? 1 : 0;
-    if (ta !== tb) return ta - tb;
-    if (ta === 0 && x.rgba[3] !== y.rgba[3]) return x.rgba[3] - y.rgba[3];
-    if (order === 'luminance') return lum(x) - lum(y) || x.word - y.word;
-    return y.count - x.count || x.word - y.word;
-  });
-  const index = new Map(entries.map((c, i) => [c.word, i]));
-  const plte = new Uint8Array(entries.length * 3);
-  let transparent = 0;
-  entries.forEach((c, i) => {
-    plte[i * 3] = c.rgba[0];
-    plte[i * 3 + 1] = c.rgba[1];
-    plte[i * 3 + 2] = c.rgba[2];
-    if (c.rgba[3] !== 255) transparent = i + 1;
-  });
-  const trns = transparent === 0 ? null : Uint8Array.from(entries.slice(0, transparent), (c) => c.rgba[3]);
-  const n = rgba.length >>> 2;
-  const u32 = new Uint32Array(rgba.buffer, rgba.byteOffset, n);
-  const indices = new Uint8Array(n);
-  for (let i = 0; i < n; i++) indices[i] = index.get(u32[i]) as number;
-  return { plte, trns, indices };
-}
-
-type Form = {
+interface Reduced {
   colourType: number;
   bpp: number;
   samples: Uint8Array;
-  plte: Uint8Array | null;
+  palette: Uint8Array | null;
   trns: Uint8Array | null;
-  filters: (number | string)[];
-};
+}
 
-function formsOf(rgba: Uint8Array): Form[] {
-  const { opaque, grey, colours } = analyse(rgba);
-  const forms: Form[] = [];
-  if (colours !== null) {
-    for (const order of ['count', 'luminance']) {
-      const p = paletteForm(rgba, colours, order);
-      forms.push({
-        colourType: 3,
-        bpp: 1,
-        samples: p.indices,
-        plte: p.plte,
-        trns: p.trns,
-        filters: order === 'count' ? [0] : [0, 'minsum'],
-      });
+function reduceImage(rgba: Uint8Array): Reduced {
+  const n = rgba.length / 4;
+  let grey = true;
+  let opaque = true;
+  let partialAlpha = false;
+  let clearRgb = -1;
+  let clearMixed = false;
+  const counts = new Map<number, number>();
+  let tooManyColours = false;
+  for (let i = 0, p = 0; i < n; i++, p += 4) {
+    const r = rgba[p];
+    const g = rgba[p + 1];
+    const b = rgba[p + 2];
+    const a = rgba[p + 3];
+    if (r !== g || g !== b) grey = false;
+    if (a !== 255) {
+      opaque = false;
+      if (a === 0) {
+        const rgb = (r << 16) | (g << 8) | b;
+        if (clearRgb < 0) clearRgb = rgb;
+        else if (clearRgb !== rgb) clearMixed = true;
+      } else {
+        partialAlpha = true;
+      }
     }
-    if (!grey) return forms;
+    if (!tooManyColours) {
+      const key = r * 0x1000000 + g * 0x10000 + b * 0x100 + a;
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+      if (counts.size > 256) tooManyColours = true;
+    }
   }
-  const key = opaque ? null : transparentKey(rgba, grey);
-  let ct: number;
-  let trns: Uint8Array | null = null;
+
+  if (grey && opaque) {
+    const samples = new Uint8Array(n);
+    for (let i = 0, p = 0; i < n; i++, p += 4) samples[i] = rgba[p];
+    return { colourType: 0, bpp: 1, samples, palette: null, trns: null };
+  }
   if (grey) {
-    ct = opaque || key !== null ? 0 : 4;
-    if (key !== null) trns = Uint8Array.of(0, key);
-  } else {
-    ct = opaque || key !== null ? 2 : 6;
-    if (key !== null) trns = Uint8Array.of(0, key >>> 16, 0, (key >>> 8) & 0xff, 0, key & 0xff);
+    const samples = new Uint8Array(n * 2);
+    for (let i = 0, p = 0, s = 0; i < n; i++, p += 4, s += 2) {
+      samples[s] = rgba[p];
+      samples[s + 1] = rgba[p + 3];
+    }
+    return { colourType: 4, bpp: 2, samples, palette: null, trns: null };
   }
-  const bpp = { 0: 1, 2: 3, 4: 2, 6: 4 }[ct] as number;
-  forms.push({ colourType: ct, bpp, samples: samplesOf(rgba, ct), plte: null, trns, filters: [0, 1, 2, 4, 'minsum', 'pairs'] });
-  return forms;
+  if (!tooManyColours) {
+    // Palette, most frequent colours first so long runs share low indices.
+    const order = [...counts.entries()].sort((x, y) => y[1] - x[1]);
+    const indexOf = new Map<number, number>();
+    const palette = new Uint8Array(order.length * 3);
+    const alphas = new Uint8Array(order.length);
+    order.forEach(([key], e) => {
+      indexOf.set(key, e);
+      palette[e * 3] = Math.floor(key / 0x1000000);
+      palette[e * 3 + 1] = Math.floor(key / 0x10000) % 256;
+      palette[e * 3 + 2] = Math.floor(key / 0x100) % 256;
+      alphas[e] = key % 256;
+    });
+    const samples = new Uint8Array(n);
+    for (let i = 0, p = 0; i < n; i++, p += 4) {
+      const key = rgba[p] * 0x1000000 + rgba[p + 1] * 0x10000 + rgba[p + 2] * 0x100 + rgba[p + 3];
+      samples[i] = indexOf.get(key) as number;
+    }
+    let trns: Uint8Array | null = null;
+    let lastAlpha = -1;
+    for (let e = 0; e < alphas.length; e++) if (alphas[e] !== 255) lastAlpha = e;
+    if (lastAlpha >= 0) trns = alphas.subarray(0, lastAlpha + 1);
+    return { colourType: 3, bpp: 1, samples, palette, trns };
+  }
+  if (opaque) {
+    const samples = new Uint8Array(n * 3);
+    for (let i = 0, p = 0, s = 0; i < n; i++, p += 4, s += 3) {
+      samples[s] = rgba[p];
+      samples[s + 1] = rgba[p + 1];
+      samples[s + 2] = rgba[p + 2];
+    }
+    return { colourType: 2, bpp: 3, samples, palette: null, trns: null };
+  }
+  if (!partialAlpha && !clearMixed && clearRgb >= 0) {
+    // Every non-opaque pixel is fully transparent and shares one colour:
+    // RGB plus a tRNS key holds the alpha channel exactly.
+    const samples = new Uint8Array(n * 3);
+    for (let i = 0, p = 0, s = 0; i < n; i++, p += 4, s += 3) {
+      samples[s] = rgba[p];
+      samples[s + 1] = rgba[p + 1];
+      samples[s + 2] = rgba[p + 2];
+    }
+    const trns = new Uint8Array([0, (clearRgb >> 16) & 0xff, 0, (clearRgb >> 8) & 0xff, 0, clearRgb & 0xff]);
+    return { colourType: 2, bpp: 3, samples, palette: null, trns };
+  }
+  return { colourType: 6, bpp: 4, samples: rgba, palette: null, trns: null };
 }
 
 // ---------------------------------------------------------------------------
-// Filtering.
+// Filtering
 // ---------------------------------------------------------------------------
-function filterRow(type: number, cur: Uint8Array, prev: Uint8Array | null, bpp: number, out: Uint8Array): void {
+
+function filterRowInto(type: number, cur: Uint8Array, prev: Uint8Array | null, bpp: number, out: Uint8Array): void {
   const n = cur.length;
   if (type === 0) {
     out.set(cur);
@@ -321,625 +305,705 @@ function filterRow(type: number, cur: Uint8Array, prev: Uint8Array | null, bpp: 
   } else if (type === 2) {
     for (let i = 0; i < n; i++) out[i] = cur[i] - (prev === null ? 0 : prev[i]);
   } else if (type === 3) {
-    for (let i = 0; i < n; i++) out[i] = cur[i] - (((i >= bpp ? cur[i - bpp] : 0) + (prev === null ? 0 : prev[i])) >> 1);
+    for (let i = 0; i < n; i++) {
+      const left = i >= bpp ? cur[i - bpp] : 0;
+      const above = prev === null ? 0 : prev[i];
+      out[i] = cur[i] - ((left + above) >> 1);
+    }
   } else {
     for (let i = 0; i < n; i++) {
-      const a = i >= bpp ? cur[i - bpp] : 0;
-      const b = prev === null ? 0 : prev[i];
-      const c = prev !== null && i >= bpp ? prev[i - bpp] : 0;
-      out[i] = cur[i] - paeth(a, b, c);
+      const left = i >= bpp ? cur[i - bpp] : 0;
+      const above = prev === null ? 0 : prev[i];
+      const upperLeft = prev !== null && i >= bpp ? prev[i - bpp] : 0;
+      out[i] = cur[i] - paeth(left, above, upperLeft);
     }
   }
 }
 
-function signedSum(row: Uint8Array): number {
-  let s = 0;
-  for (let i = 0; i < row.length; i++) {
-    const v = row[i];
-    s += v < 128 ? v : 256 - v;
-  }
-  return s;
+interface FilteredChoice {
+  name: string;
+  raw: Uint8Array;
+  zSize: number;
 }
 
-function pairsOf(row: Uint8Array, seen: Uint32Array, stamp: number): number {
-  let n = 0;
-  for (let i = 1; i < row.length; i++) {
-    const pair = (row[i - 1] << 8) | row[i];
-    if (seen[pair] !== stamp) {
-      seen[pair] = stamp;
-      n++;
-    }
-  }
-  return n;
-}
-
-/** Filter `samples` by `choice` (a fixed type, 'minsum' or 'pairs') into a fresh raw buffer. */
-function filtered(samples: Uint8Array, width: number, height: number, bpp: number, choice: number | string): Uint8Array {
+function screenFilters(samples: Uint8Array, width: number, height: number, bpp: number): FilteredChoice {
   const stride = width * bpp;
-  const raw = new Uint8Array(height * (stride + 1));
-  const trial = Array.from({ length: 5 }, () => new Uint8Array(stride));
-  const seen = new Uint32Array(65536);
-  let stamp = 0;
+  const rowLen = stride + 1;
+  const total = height * rowLen;
+  const candidates: { name: string; raw: Uint8Array }[] = [];
+  for (let t = 0; t < 5; t++) {
+    const raw = new Uint8Array(total);
+    for (let y = 0; y < height; y++) {
+      const cur = samples.subarray(y * stride, (y + 1) * stride);
+      const prev = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
+      raw[y * rowLen] = t;
+      filterRowInto(t, cur, prev, bpp, raw.subarray(y * rowLen + 1, (y + 1) * rowLen));
+    }
+    candidates.push({ name: 'fixed-' + t, raw });
+  }
+  const trial = [0, 1, 2, 3, 4].map(() => new Uint8Array(stride));
+  const rawMinSum = new Uint8Array(total);
+  const rawFewestNonZero = new Uint8Array(total);
   for (let y = 0; y < height; y++) {
     const cur = samples.subarray(y * stride, (y + 1) * stride);
     const prev = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
-    const at = y * (stride + 1);
-    if (typeof choice === 'number') {
-      raw[at] = choice;
-      filterRow(choice, cur, prev, bpp, raw.subarray(at + 1, at + 1 + stride));
-      continue;
-    }
-    let type = 0;
-    let best = Infinity;
+    for (let t = 0; t < 5; t++) filterRowInto(t, cur, prev, bpp, trial[t]);
+    let bestSum = Infinity;
+    let bestSumType = 0;
+    let bestNonZero = Infinity;
+    let bestNonZeroType = 0;
     for (let t = 0; t < 5; t++) {
-      filterRow(t, cur, prev, bpp, trial[t]);
-      const cost = choice === 'minsum' ? signedSum(trial[t]) : pairsOf(trial[t], seen, ++stamp);
-      if (cost < best) {
-        best = cost;
-        type = t;
+      let sum = 0;
+      let nonZero = 0;
+      const row = trial[t];
+      for (let i = 0; i < stride; i++) {
+        const v = row[i];
+        sum += v < 128 ? v : 256 - v;
+        if (v !== 0) nonZero++;
+      }
+      if (sum < bestSum) {
+        bestSum = sum;
+        bestSumType = t;
+      }
+      if (nonZero < bestNonZero) {
+        bestNonZero = nonZero;
+        bestNonZeroType = t;
       }
     }
-    raw[at] = type;
-    raw.set(trial[type], at + 1);
+    rawMinSum[y * rowLen] = bestSumType;
+    rawMinSum.set(trial[bestSumType], y * rowLen + 1);
+    rawFewestNonZero[y * rowLen] = bestNonZeroType;
+    rawFewestNonZero.set(trial[bestNonZeroType], y * rowLen + 1);
   }
-  return raw;
+  candidates.push({ name: 'minsum', raw: rawMinSum });
+  candidates.push({ name: 'fewest-nonzero', raw: rawFewestNonZero });
+  let best: FilteredChoice | null = null;
+  for (const c of candidates) {
+    const size = deflateSync(c.raw, { level: 6 }).length;
+    if (best === null || size < best.zSize) best = { name: c.name, raw: c.raw, zSize: size };
+  }
+  return best as FilteredChoice;
 }
 
 // ---------------------------------------------------------------------------
-// Optimal-parsing DEFLATE (own implementation, in the manner of zopfli).
+// DEFLATE: optimal-parsing encoder
 // ---------------------------------------------------------------------------
+
 const LEN_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
 const LEN_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
-const LEN_SYM = new Uint8Array(259);
-for (let s = 0; s < 29; s++) {
-  const end = s === 28 ? 258 : LEN_BASE[s + 1] - 1;
-  for (let l = LEN_BASE[s]; l <= end; l++) LEN_SYM[l] = s;
-}
 const DIST_BASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
 const DIST_EXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
-const DIST_SYM = new Uint16Array(32769);
-for (let s = 0; s < 30; s++) {
-  const end = s === 29 ? 32768 : DIST_BASE[s + 1] - 1;
-  for (let d = DIST_BASE[s]; d <= end; d++) DIST_SYM[d] = s;
-}
-// Candidate match lengths: the maximum length of each length-symbol range.
-const CANDIDATES: number[] = [];
-for (let s = 0; s < 29; s++) CANDIDATES.push(s === 28 ? 258 : LEN_BASE[s + 1] - 1);
-const FIXED_LITLEN = new Uint8Array(288);
-for (let i = 0; i < 288; i++) FIXED_LITLEN[i] = i < 144 ? 8 : i < 256 ? 9 : i < 280 ? 7 : 8;
-const FIXED_DIST = new Uint8Array(30).fill(5);
 
-const HASH_BITS = 17;
-const HASH_SIZE = 1 << HASH_BITS;
-const HASH_MASK = HASH_SIZE - 1;
-
-function hash3(data: Uint8Array, i: number): number {
-  const h = (data[i] << 16) ^ (data[i + 1] << 8) ^ data[i + 2];
-  return (Math.imul(h, 2654435761) >>> (32 - HASH_BITS)) & HASH_MASK;
+function lenSymbolOf(len: number): number {
+  let s = 0;
+  while (s + 1 < LEN_BASE.length && LEN_BASE[s + 1] <= len) s++;
+  return s;
 }
 
-/** Longest match (length, distance) at every position; window 32768, chain cap 32, early exit at length 64. */
-function findMatches(data: Uint8Array): { len: Uint16Array; dist: Uint16Array } {
-  const n = data.length;
-  const head = new Int32Array(HASH_SIZE).fill(-1);
-  const prev = new Int32Array(n).fill(-1);
-  const len = new Uint16Array(n);
-  const dist = new Uint16Array(n);
-  const chain = 32;
-  const good = 128;
-  const maxLen = 258;
-  for (let i = 0; i < n; i++) {
-    if (i + 3 > n) break;
-    const h = hash3(data, i);
-    let cand = head[h];
-    head[h] = i;
-    prev[i] = cand;
-    let best = 0;
-    let bestDist = 0;
-    const limit = Math.max(0, i - 32768);
-    let tries = 0;
-    let steps = 0;
-    const maxPossible = Math.min(maxLen, n - i);
-    const maxSteps = chain * 8;
-    while (cand >= limit && tries < chain && steps < maxSteps) {
-      steps++;
-      // The hash only guarantees equal hashes, not equal bytes.
-      if (data[cand] !== data[i] || data[cand + 1] !== data[i + 1] || data[cand + 2] !== data[i + 2]) {
-        cand = prev[cand];
-        continue;
-      }
-      tries++;
-      let l = 3;
-      const d = i - cand;
-      const end = i + maxPossible;
-      while (i + l < end && data[cand + l] === data[i + l]) l++;
-      if (l > best) {
-        best = l;
-        bestDist = d;
-        if (l >= maxPossible || l >= good) break;
-      }
-      cand = prev[cand];
-    }
-    if (best >= 3) {
-      len[i] = best;
-      dist[i] = bestDist;
-    }
-  }
-  return { len, dist };
+function distSymbolOf(dist: number): number {
+  let s = 0;
+  while (s + 1 < DIST_BASE.length && DIST_BASE[s + 1] <= dist) s++;
+  return s;
 }
 
-/** Optimal code lengths (max `maxBits`) from frequencies. */
-function huffmanLengths(freq: Uint32Array, maxBits: number): Uint8Array {
-  const n = freq.length;
-  const lens = new Uint8Array(n);
-  let count = 0;
-  let only = -1;
-  for (let i = 0; i < n; i++) if (freq[i] > 0) { count++; only = i; }
-  if (count === 0) return lens;
-  if (count === 1) {
-    lens[only] = 1;
-    lens[only === 0 ? 1 : 0] = 1;
-    return lens;
-  }
-  const heapF: number[] = [];
-  const heapS: number[] = [];
-  const push = (f: number, s: number): void => {
-    heapF.push(f);
-    heapS.push(s);
-    let i = heapF.length - 1;
-    while (i > 0) {
-      const p = (i - 1) >> 1;
-      if (heapF[p] <= heapF[i]) break;
-      [heapF[p], heapF[i]] = [heapF[i], heapF[p]];
-      [heapS[p], heapS[i]] = [heapS[i], heapS[p]];
-      i = p;
-    }
-  };
-  const pop = (): [number, number] => {
-    const topF = heapF[0];
-    const topS = heapS[0];
-    const lastF = heapF.pop() as number;
-    const lastS = heapS.pop() as number;
-    if (heapF.length > 0) {
-      heapF[0] = lastF;
-      heapS[0] = lastS;
-      let i = 0;
-      for (;;) {
-        const l = i * 2 + 1;
-        const r = l + 1;
-        let m = i;
-        if (l < heapF.length && heapF[l] < heapF[m]) m = l;
-        if (r < heapF.length && heapF[r] < heapF[m]) m = r;
-        if (m === i) break;
-        [heapF[m], heapF[i]] = [heapF[i], heapF[m]];
-        [heapS[m], heapS[i]] = [heapS[i], heapS[m]];
-        i = m;
-      }
-    }
-    return [topF, topS];
-  };
-  for (let i = 0; i < n; i++) if (freq[i] > 0) push(freq[i], i);
-  const children = new Map<number, [number, number]>();
-  let nextId = n;
-  while (heapF.length > 1) {
-    const [f1, s1] = pop();
-    const [f2, s2] = pop();
-    const id = nextId++;
-    children.set(id, [s1, s2]);
-    push(f1 + f2, id);
-  }
-  const root = heapS[0];
-  const stack: [number, number][] = [[root, 0]];
-  while (stack.length > 0) {
-    const [node, d] = stack.pop() as [number, number];
-    if (node < n) {
-      lens[node] = d;
-      continue;
-    }
-    const ch = children.get(node) as [number, number];
-    stack.push([ch[0], d + 1], [ch[1], d + 1]);
-  }
-  // Limit lengths to maxBits (zlib gen_bitlen's overflow fix, on the counts).
-  let maxLen = 0;
-  for (let i = 0; i < n; i++) if (lens[i] > maxLen) maxLen = lens[i];
-  if (maxLen > maxBits) {
-    const bl = new Uint32Array(maxBits + 1);
-    for (let i = 0; i < n; i++) {
-      if (lens[i] > 0) bl[lens[i] > maxBits ? maxBits : lens[i]]++;
-    }
-    // Scaled Kraft sum; valid when <= 2^maxBits. Each move lowers it by one.
-    let kraft = 0;
-    for (let b = 1; b <= maxBits; b++) kraft += bl[b] * (1 << (maxBits - b));
-    const target = 1 << maxBits;
-    while (kraft > target) {
-      let bits = maxBits - 1;
-      while (bits > 0 && bl[bits] === 0) bits--;
-      if (bits === 0 || bl[maxBits] === 0) break;
-      bl[bits]--;
-      bl[bits + 1] += 2;
-      bl[maxBits]--;
-      kraft -= 1;
-    }
-    const order: number[] = [];
-    for (let i = 0; i < n; i++) if (freq[i] > 0) order.push(i);
-    order.sort((a, b) => freq[b] - freq[a] || a - b);
-    lens.fill(0);
-    let idx = 0;
-    for (let b = 1; b <= maxBits; b++) {
-      for (let k = 0; k < bl[b]; k++) lens[order[idx++]] = b;
-    }
-  }
-  return lens;
-}
-
-/** Canonical Huffman codes from lengths (bit-reversed for LSB-first packing). */
-function canonicalCodes(lens: Uint8Array): { codes: Uint32Array; lens: Uint8Array } {
-  const n = lens.length;
-  const maxBits = Math.max(0, ...lens);
-  const blCount = new Uint32Array(maxBits + 1);
-  for (let i = 0; i < n; i++) blCount[lens[i]]++;
-  blCount[0] = 0;
-  const nextCode = new Uint32Array(maxBits + 1);
-  let code = 0;
-  for (let b = 1; b <= maxBits; b++) {
-    code = (code + blCount[b - 1]) << 1;
-    nextCode[b] = code;
-  }
-  const codes = new Uint32Array(n);
-  for (let i = 0; i < n; i++) {
-    const l = lens[i];
-    if (l > 0) {
-      let c = nextCode[l]++;
-      let r = 0;
-      for (let b = 0; b < l; b++) {
-        r = (r << 1) | (c & 1);
-        c >>>= 1;
-      }
-      codes[i] = r;
-    }
-  }
-  return { codes, lens };
-}
+const FIXED_LIT_LEN: number[] = (() => {
+  const a = new Array<number>(288).fill(8);
+  for (let i = 144; i < 256; i++) a[i] = 9;
+  for (let i = 256; i < 280; i++) a[i] = 7;
+  return a;
+})();
+const FIXED_DIST_LEN: number[] = new Array<number>(30).fill(5);
 
 class BitWriter {
   bytes: number[] = [];
-  acc = 0;
-  nbits = 0;
-  bits(value: number, len: number): void {
-    this.acc |= (value & ((1 << len) - 1)) << this.nbits;
-    this.nbits += len;
+  private acc = 0;
+  private nbits = 0;
+  writeBits(value: number, count: number): void {
+    this.acc |= (value & ((1 << count) - 1)) << this.nbits;
+    this.nbits += count;
     while (this.nbits >= 8) {
       this.bytes.push(this.acc & 0xff);
       this.acc >>>= 8;
       this.nbits -= 8;
     }
   }
-  result(): Uint8Array {
+  alignByte(): void {
     if (this.nbits > 0) {
       this.bytes.push(this.acc & 0xff);
       this.acc = 0;
       this.nbits = 0;
     }
+  }
+  finish(): Uint8Array {
+    this.alignByte();
     return Uint8Array.from(this.bytes);
   }
 }
 
-type Ops = { starts: number[]; lens: number[]; dists: number[]; cost: number };
-
-function costTables(litLens: Uint8Array, distLens: Uint8Array): { litCost: Float64Array; lenCost: Float64Array; distCost: Float64Array } {
-  // A symbol the tree does not use costs the longest code in its tree, never zero.
-  let maxLit = 1;
-  for (let i = 0; i < 288; i++) if (litLens[i] > maxLit) maxLit = litLens[i];
-  let maxDist = 1;
-  for (let i = 0; i < 30; i++) if (distLens[i] > maxDist) maxDist = distLens[i];
-  const litCost = new Float64Array(288);
-  for (let i = 0; i < 288; i++) litCost[i] = litLens[i] === 0 ? maxLit : litLens[i];
-  const lenCost = new Float64Array(259);
-  lenCost[0] = lenCost[1] = lenCost[2] = Infinity;
-  for (let l = 3; l <= 258; l++) {
-    const s = LEN_SYM[l];
-    lenCost[l] = (litLens[257 + s] === 0 ? maxLit : litLens[257 + s]) + LEN_EXTRA[s];
+function reverseBits(code: number, len: number): number {
+  let r = 0;
+  for (let i = 0; i < len; i++) {
+    r = (r << 1) | (code & 1);
+    code >>>= 1;
   }
-  const distCost = new Float64Array(30);
-  for (let i = 0; i < 30; i++) distCost[i] = (distLens[i] === 0 ? maxDist : distLens[i]) + DIST_EXTRA[i];
-  return { litCost, lenCost, distCost };
+  return r;
 }
 
-/** Shortest-path parse of data[s..e): cheapest literal/match sequence.
- *  `allLengths` also tries every length 3..maxL (not only the symbol-range
- *  maxima), so a match can end exactly where the next good match starts. */
-function optimalParse(data: Uint8Array, mlen: Uint16Array, mdist: Uint16Array, s: number, e: number, litCost: Float64Array, lenCost: Float64Array, distCost: Float64Array, allLengths = false): Ops {
-  const n = e - s;
-  const costs = new Float64Array(n + 1);
-  costs.fill(Infinity);
-  costs[0] = 0;
-  const opLen = new Int16Array(n + 1);
-  const opDist = new Int32Array(n + 1);
-  for (let i = 0; i < n; i++) {
-    const base = costs[i];
-    if (base === Infinity) continue;
-    const pos = s + i;
-    const lc = base + litCost[data[pos]];
-    if (lc < costs[i + 1]) {
-      costs[i + 1] = lc;
-      opLen[i + 1] = 1;
-      opDist[i + 1] = 0;
+/** Canonical Huffman codes for a set of code lengths (index = symbol). */
+function canonicalCodes(lengths: number[]): number[] {
+  let maxLen = 0;
+  for (const l of lengths) if (l > maxLen) maxLen = l;
+  const blCount = new Array<number>(maxLen + 1).fill(0);
+  for (const l of lengths) if (l > 0) blCount[l]++;
+  const nextCode = new Array<number>(maxLen + 1).fill(0);
+  let code = 0;
+  for (let bits = 1; bits <= maxLen; bits++) {
+    code = (code + blCount[bits - 1]) << 1;
+    nextCode[bits] = code;
+  }
+  const codes = new Array<number>(lengths.length).fill(0);
+  for (let s = 0; s < lengths.length; s++) {
+    if (lengths[s] > 0) {
+      codes[s] = nextCode[lengths[s]];
+      nextCode[lengths[s]]++;
     }
-    const L = mlen[pos];
-    if (L >= 3) {
-      const dc = distCost[DIST_SYM[mdist[pos]]];
-      const maxL = Math.min(L, n - i);
-      if (maxL >= 3) {
-        if (allLengths) {
-          for (let l = 3; l <= maxL; l++) {
-            const nc = base + lenCost[l] + dc;
-            if (nc < costs[i + l]) {
-              costs[i + l] = nc;
-              opLen[i + l] = l;
-              opDist[i + l] = mdist[pos];
+  }
+  return codes;
+}
+
+/**
+ * Code lengths from symbol frequencies, capped at maxLen. Builds a Huffman
+ * tree by repeated merging, then applies the standard overflow fix: lengths
+ * past the cap are folded back down and the shortest lengths are handed to
+ * the most frequent symbols.
+ */
+function buildLengths(freqs: number[], maxLen: number): number[] {
+  const n = freqs.length;
+  const lengths = new Array<number>(n).fill(0);
+  interface HNode {
+    freq: number;
+    sym: number;
+    left: HNode | null;
+    right: HNode | null;
+  }
+  const leaves: HNode[] = [];
+  for (let s = 0; s < n; s++) {
+    if (freqs[s] > 0) leaves.push({ freq: freqs[s], sym: s, left: null, right: null });
+  }
+  if (leaves.length === 0) return lengths;
+  if (leaves.length === 1) {
+    lengths[leaves[0].sym] = 1;
+    return lengths;
+  }
+  const pool = leaves.slice();
+  while (pool.length > 1) {
+    let i1 = 0;
+    let i2 = 1;
+    if (pool[i2].freq < pool[i1].freq) {
+      const t = i1;
+      i1 = i2;
+      i2 = t;
+    }
+    for (let i = 2; i < pool.length; i++) {
+      if (pool[i].freq < pool[i1].freq) {
+        i2 = i1;
+        i1 = i;
+      } else if (pool[i].freq < pool[i2].freq) {
+        i2 = i;
+      }
+    }
+    const a = pool[i1];
+    const b = pool[i2];
+    pool.splice(Math.max(i1, i2), 1);
+    pool.splice(Math.min(i1, i2), 1);
+    pool.push({ freq: a.freq + b.freq, sym: -1, left: a, right: b });
+  }
+  const depths = new Map<number, number>();
+  const walk = (nd: HNode, d: number): void => {
+    if (nd.sym >= 0) {
+      depths.set(nd.sym, d);
+      return;
+    }
+    walk(nd.left as HNode, d + 1);
+    walk(nd.right as HNode, d + 1);
+  };
+  walk(pool[0], 0);
+  let overflow = 0;
+  for (const d of depths.values()) if (d > maxLen) overflow++;
+  if (overflow === 0) {
+    for (const [s, d] of depths) lengths[s] = d;
+    return lengths;
+  }
+  const blCount = new Array<number>(maxLen + 1).fill(0);
+  for (const d of depths.values()) blCount[Math.min(d, maxLen)]++;
+  let ov = overflow;
+  while (ov > 0) {
+    let bits = maxLen - 1;
+    while (bits > 0 && blCount[bits] === 0) bits--;
+    if (bits === 0) break;
+    blCount[bits]--;
+    blCount[bits + 1] += 2;
+    blCount[maxLen]--;
+    ov -= 2;
+  }
+  const byFreq = [...depths.keys()].sort((a, b) => freqs[b] - freqs[a]);
+  let idx = 0;
+  for (let d = 1; d <= maxLen; d++) {
+    for (let k = 0; k < blCount[d] && idx < byFreq.length; k++) lengths[byFreq[idx++]] = d;
+  }
+  return lengths;
+}
+
+/** Hash-chain LZ77 match search over one block. */
+function findMatches(data: Uint8Array): { bestLen: Int32Array; bestDist: Int32Array } {
+  const n = data.length;
+  const bestLen = new Int32Array(n);
+  const bestDist = new Int32Array(n);
+  const head = new Int32Array(32768).fill(-1);
+  const prev = new Int32Array(n).fill(-1);
+  for (let i = 0; i < n; i++) {
+    if (i + 3 > n) continue;
+    const h = ((data[i] << 10) ^ (data[i + 1] << 5) ^ data[i + 2]) & 32767;
+    let cand = head[h];
+    let best = 0;
+    let bestD = 0;
+    let steps = 0;
+    const maxLen = Math.min(258, n - i);
+    while (cand >= 0 && steps < 64) {
+      const dist = i - cand;
+      if (dist > 32768) break;
+      let len = 0;
+      while (len < maxLen && data[cand + len] === data[i + len]) len++;
+      if (len > best) {
+        best = len;
+        bestD = dist;
+        if (len >= 128) break;
+      }
+      cand = prev[cand];
+      steps++;
+    }
+    if (best >= 3) {
+      bestLen[i] = best;
+      bestDist[i] = bestD;
+    }
+    prev[i] = head[h];
+    head[h] = i;
+  }
+  return { bestLen, bestDist };
+}
+
+interface ParseResult {
+  opLen: Int32Array;
+  opDist: Int32Array;
+  opCount: number;
+  litFreq: number[];
+  distFreq: number[];
+}
+
+/**
+ * Shortest-path parse of a block. litCost is indexed by literal/length
+ * symbol, lenCost by match length, distCostByDist by distance. When refine
+ * is false only lengths 3 and the longest match are tried at each position;
+ * when true every length up to the longest (a capped set for very long
+ * matches) is tried.
+ */
+function parseBlock(
+  data: Uint8Array,
+  bestLen: Int32Array,
+  bestDist: Int32Array,
+  litCost: number[],
+  lenCost: number[],
+  distCostByDist: Int32Array,
+  refine: boolean,
+): ParseResult {
+  const n = data.length;
+  const dp = new Float64Array(n + 1).fill(Infinity);
+  dp[0] = 0;
+  const choiceLen = new Int32Array(n + 1);
+  const choiceDist = new Int32Array(n + 1);
+  for (let i = 0; i < n; i++) {
+    const base = dp[i];
+    if (base === Infinity) continue;
+    const lit = base + litCost[data[i]];
+    if (lit < dp[i + 1]) {
+      dp[i + 1] = lit;
+      choiceLen[i + 1] = 0;
+    }
+    const bl = bestLen[i];
+    if (bl >= 3) {
+      const dcost = distCostByDist[bestDist[i]];
+      if (refine) {
+        if (bl <= 128) {
+          for (let l = 3; l <= bl; l++) {
+            const c = base + lenCost[l] + dcost;
+            if (c < dp[i + l]) {
+              dp[i + l] = c;
+              choiceLen[i + l] = l;
+              choiceDist[i + l] = bestDist[i];
             }
           }
         } else {
-          for (let c = 0; c < CANDIDATES.length; c++) {
-            const l = CANDIDATES[c];
-            if (l > maxL) break;
-            const nc = base + lenCost[l] + dc;
-            if (nc < costs[i + l]) {
-              costs[i + l] = nc;
-              opLen[i + l] = l;
-              opDist[i + l] = mdist[pos];
+          for (const l of [3, 32, 64, 96, 128, bl]) {
+            const c = base + lenCost[l] + dcost;
+            if (c < dp[i + l]) {
+              dp[i + l] = c;
+              choiceLen[i + l] = l;
+              choiceDist[i + l] = bestDist[i];
             }
           }
-          if (maxL !== CANDIDATES[CANDIDATES.length - 1] && !CANDIDATES.includes(maxL)) {
-            const nc = base + lenCost[maxL] + dc;
-            if (nc < costs[i + maxL]) {
-              costs[i + maxL] = nc;
-              opLen[i + maxL] = maxL;
-              opDist[i + maxL] = mdist[pos];
-            }
+        }
+      } else {
+        for (const l of [3, bl]) {
+          const c = base + lenCost[l] + dcost;
+          if (c < dp[i + l]) {
+            dp[i + l] = c;
+            choiceLen[i + l] = l;
+            choiceDist[i + l] = bestDist[i];
           }
         }
       }
     }
   }
-  const starts: number[] = [];
-  const lens: number[] = [];
-  const dists: number[] = [];
-  let j = n;
-  while (j > 0) {
-    const l = opLen[j];
-    const d = opDist[j];
-    starts.push(j - l);
-    lens.push(l);
-    dists.push(d);
-    j -= l;
+  const opLen = new Int32Array(n + 1);
+  const opDist = new Int32Array(n + 1);
+  const litFreq = new Array<number>(288).fill(0);
+  const distFreq = new Array<number>(30).fill(0);
+  let count = 0;
+  let pos = n;
+  while (pos > 0) {
+    const l = choiceLen[pos];
+    if (l === 0) {
+      opLen[count] = 0;
+      opDist[count] = data[pos - 1];
+      litFreq[data[pos - 1]]++;
+      pos -= 1;
+    } else {
+      opLen[count] = l;
+      opDist[count] = choiceDist[pos];
+      litFreq[257 + lenSymbolOf(l)]++;
+      distFreq[distSymbolOf(choiceDist[pos])]++;
+      pos -= l;
+    }
+    count++;
   }
-  starts.reverse();
-  lens.reverse();
-  dists.reverse();
-  return { starts, lens, dists, cost: costs[n] };
+  litFreq[256]++;
+  for (let a = 0, b = count - 1; a < b; a++, b--) {
+    const tl = opLen[a];
+    const td = opDist[a];
+    opLen[a] = opLen[b];
+    opDist[a] = opDist[b];
+    opLen[b] = tl;
+    opDist[b] = td;
+  }
+  return { opLen, opDist, opCount: count, litFreq, distFreq };
 }
 
-function frequencies(data: Uint8Array, s: number, ops: Ops): { litFreq: Uint32Array; distFreq: Uint32Array } {
-  const litFreq = new Uint32Array(288);
-  const distFreq = new Uint32Array(30);
-  for (let k = 0; k < ops.lens.length; k++) {
-    const l = ops.lens[k];
-    if (l === 1) litFreq[data[s + ops.starts[k]]]++;
-    else {
-      litFreq[257 + LEN_SYM[l]]++;
-      distFreq[DIST_SYM[ops.dists[k]]]++;
-    }
+function costsFromLengths(litLen: number[], distLen: number[]): {
+  litCost: number[];
+  lenCost: number[];
+  distCostByDist: Int32Array;
+} {
+  const litCost = litLen.slice();
+  const lenCost = new Array<number>(259).fill(0);
+  for (let l = 3; l <= 258; l++) {
+    const s = lenSymbolOf(l);
+    lenCost[l] = litLen[257 + s] + LEN_EXTRA[s];
   }
-  litFreq[256] = 1;
-  return { litFreq, distFreq };
+  const distCostByDist = new Int32Array(32769);
+  for (let d = 1; d <= 32768; d++) {
+    const s = distSymbolOf(d);
+    distCostByDist[d] = distLen[s] + DIST_EXTRA[s];
+  }
+  return { litCost, lenCost, distCostByDist };
 }
 
 const CL_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
 
-function emitDynamic(w: BitWriter, data: Uint8Array, s: number, ops: Ops, litLens: Uint8Array, distLens: Uint8Array): void {
-  const { codes: litCodes } = canonicalCodes(litLens);
-  const { codes: distCodes } = canonicalCodes(distLens);
-  let hlit = 29;
-  while (hlit > 0 && litLens[256 + hlit] === 0) hlit--;
-  let hdist = 29;
-  while (hdist > 0 && distLens[hdist] === 0) hdist--;
-  const hlitN = 257 + hlit;
-  const hdistN = 1 + hdist;
-  const all = new Uint8Array(hlitN + hdistN);
-  all.set(litLens.subarray(0, hlitN), 0);
-  all.set(distLens.subarray(0, hdistN), hlitN);
-  const clFreq = new Uint32Array(19);
-  const items: { sym: number; extra: number; extraBits: number }[] = [];
+/** Run-length encode a run of code lengths for a dynamic header. */
+function rleCodeLengths(seq: number[]): { symbols: number[]; extras: number[] } {
+  const symbols: number[] = [];
+  const extras: number[] = [];
   let i = 0;
-  while (i < all.length) {
-    const v = all[i];
+  while (i < seq.length) {
+    const v = seq[i];
     let run = 1;
-    while (i + run < all.length && all[i + run] === v) run++;
+    while (i + run < seq.length && seq[i + run] === v) run++;
     if (v === 0) {
-      let r = run;
-      while (r >= 11) {
-        const take = Math.min(r, 138);
-        items.push({ sym: 18, extra: take - 11, extraBits: 7 });
-        clFreq[18]++;
-        r -= take;
+      let left = run;
+      while (left >= 11) {
+        const take = Math.min(left, 138);
+        symbols.push(18);
+        extras.push(take - 11);
+        left -= take;
       }
-      if (r >= 3) {
-        items.push({ sym: 17, extra: r - 3, extraBits: 3 });
-        clFreq[17]++;
-        r = 0;
+      if (left >= 3) {
+        symbols.push(17);
+        extras.push(left - 3);
+        left = 0;
       }
-      while (r > 0) {
-        items.push({ sym: 0, extra: 0, extraBits: 0 });
-        clFreq[0]++;
-        r--;
+      while (left > 0) {
+        symbols.push(0);
+        extras.push(0);
+        left--;
       }
     } else {
-      items.push({ sym: v, extra: 0, extraBits: 0 });
-      clFreq[v]++;
-      let r = run - 1;
-      while (r >= 3) {
-        const take = Math.min(r, 6);
-        items.push({ sym: 16, extra: take - 3, extraBits: 2 });
-        clFreq[16]++;
-        r -= take;
+      symbols.push(v);
+      extras.push(0);
+      let left = run - 1;
+      while (left >= 3) {
+        const take = Math.min(left, 6);
+        symbols.push(16);
+        extras.push(take - 3);
+        left -= take;
       }
-      while (r > 0) {
-        items.push({ sym: v, extra: 0, extraBits: 0 });
-        clFreq[v]++;
-        r--;
+      while (left > 0) {
+        symbols.push(v);
+        extras.push(0);
+        left--;
       }
     }
     i += run;
   }
-  const clLens = huffmanLengths(clFreq, 7);
-  const { codes: clCodes } = canonicalCodes(clLens);
-  let hclen = 19;
-  while (hclen > 4 && clLens[CL_ORDER[hclen - 1]] === 0) hclen--;
-  w.bits(hlitN - 257, 5);
-  w.bits(hdistN - 1, 5);
-  w.bits(hclen - 4, 4);
-  for (let k = 0; k < hclen; k++) w.bits(clLens[CL_ORDER[k]], 3);
-  for (const it of items) {
-    w.bits(clCodes[it.sym], clLens[it.sym]);
-    if (it.extraBits > 0) w.bits(it.extra, it.extraBits);
+  return { symbols, extras };
+}
+
+function emitDynamicBlock(
+  bw: BitWriter,
+  isLast: boolean,
+  parsed: ParseResult,
+  litLen: number[],
+  distLen: number[],
+): void {
+  let hlit = 257;
+  for (let i = 287; i >= 257; i--) {
+    if (litLen[i] > 0) {
+      hlit = i + 1;
+      break;
+    }
   }
-  for (let k = 0; k < ops.lens.length; k++) {
-    const l = ops.lens[k];
-    if (l === 1) {
-      const sym = data[s + ops.starts[k]];
-      w.bits(litCodes[sym], litLens[sym]);
+  let hdist = 1;
+  for (let i = 29; i >= 1; i--) {
+    if (distLen[i] > 0) {
+      hdist = i + 1;
+      break;
+    }
+  }
+  const seq = litLen.slice(0, hlit).concat(distLen.slice(0, hdist));
+  const rle = rleCodeLengths(seq);
+  const clFreq = new Array<number>(19).fill(0);
+  for (const s of rle.symbols) clFreq[s]++;
+  const clLen = buildLengths(clFreq, 7);
+  let hclen = 4;
+  for (let i = 18; i >= 4; i--) {
+    if (clLen[CL_ORDER[i]] > 0) {
+      hclen = i + 1;
+      break;
+    }
+  }
+  const clCode = canonicalCodes(clLen);
+  const litCode = canonicalCodes(litLen);
+  const distCode = canonicalCodes(distLen);
+  bw.writeBits(isLast ? 1 : 0, 1);
+  bw.writeBits(2, 2);
+  bw.writeBits(hlit - 257, 5);
+  bw.writeBits(hdist - 1, 5);
+  bw.writeBits(hclen - 4, 4);
+  for (let i = 0; i < hclen; i++) bw.writeBits(clLen[CL_ORDER[i]], 3);
+  for (let k = 0; k < rle.symbols.length; k++) {
+    const s = rle.symbols[k];
+    bw.writeBits(reverseBits(clCode[s], clLen[s]), clLen[s]);
+    if (s === 16) bw.writeBits(rle.extras[k], 2);
+    else if (s === 17) bw.writeBits(rle.extras[k], 3);
+    else if (s === 18) bw.writeBits(rle.extras[k], 7);
+  }
+  for (let k = 0; k < parsed.opCount; k++) {
+    const l = parsed.opLen[k];
+    if (l === 0) {
+      const sym = parsed.opDist[k];
+      bw.writeBits(reverseBits(litCode[sym], litLen[sym]), litLen[sym]);
     } else {
-      const ls = LEN_SYM[l];
-      w.bits(litCodes[257 + ls], litLens[257 + ls]);
-      if (LEN_EXTRA[ls] > 0) w.bits(l - LEN_BASE[ls], LEN_EXTRA[ls]);
-      const d = ops.dists[k];
-      const ds = DIST_SYM[d];
-      w.bits(distCodes[ds], distLens[ds]);
-      if (DIST_EXTRA[ds] > 0) w.bits(d - DIST_BASE[ds], DIST_EXTRA[ds]);
+      const s = lenSymbolOf(l);
+      const sym = 257 + s;
+      bw.writeBits(reverseBits(litCode[sym], litLen[sym]), litLen[sym]);
+      if (LEN_EXTRA[s] > 0) bw.writeBits(l - LEN_BASE[s], LEN_EXTRA[s]);
+      const d = parsed.opDist[k];
+      const ds = distSymbolOf(d);
+      bw.writeBits(reverseBits(distCode[ds], distLen[ds]), distLen[ds]);
+      if (DIST_EXTRA[ds] > 0) bw.writeBits(d - DIST_BASE[ds], DIST_EXTRA[ds]);
     }
   }
-  w.bits(litCodes[256], litLens[256]);
+  bw.writeBits(reverseBits(litCode[256], litLen[256]), litLen[256]);
 }
 
-function emitFixed(w: BitWriter, data: Uint8Array, s: number, ops: Ops): void {
-  const { codes: litCodes } = canonicalCodes(FIXED_LITLEN);
-  const { codes: distCodes } = canonicalCodes(FIXED_DIST);
-  for (let k = 0; k < ops.lens.length; k++) {
-    const l = ops.lens[k];
-    if (l === 1) {
-      const sym = data[s + ops.starts[k]];
-      w.bits(litCodes[sym], FIXED_LITLEN[sym]);
+function emitFixedBlock(bw: BitWriter, isLast: boolean, parsed: ParseResult): void {
+  const litCode = canonicalCodes(FIXED_LIT_LEN);
+  const distCode = canonicalCodes(FIXED_DIST_LEN);
+  bw.writeBits(isLast ? 1 : 0, 1);
+  bw.writeBits(1, 2);
+  for (let k = 0; k < parsed.opCount; k++) {
+    const l = parsed.opLen[k];
+    if (l === 0) {
+      const sym = parsed.opDist[k];
+      bw.writeBits(reverseBits(litCode[sym], FIXED_LIT_LEN[sym]), FIXED_LIT_LEN[sym]);
     } else {
-      const ls = LEN_SYM[l];
-      w.bits(litCodes[257 + ls], FIXED_LITLEN[257 + ls]);
-      if (LEN_EXTRA[ls] > 0) w.bits(l - LEN_BASE[ls], LEN_EXTRA[ls]);
-      const d = ops.dists[k];
-      const ds = DIST_SYM[d];
-      w.bits(distCodes[ds], FIXED_DIST[ds]);
-      if (DIST_EXTRA[ds] > 0) w.bits(d - DIST_BASE[ds], DIST_EXTRA[ds]);
+      const s = lenSymbolOf(l);
+      const sym = 257 + s;
+      bw.writeBits(reverseBits(litCode[sym], FIXED_LIT_LEN[sym]), FIXED_LIT_LEN[sym]);
+      if (LEN_EXTRA[s] > 0) bw.writeBits(l - LEN_BASE[s], LEN_EXTRA[s]);
+      const d = parsed.opDist[k];
+      const ds = distSymbolOf(d);
+      bw.writeBits(reverseBits(distCode[ds], FIXED_DIST_LEN[ds]), FIXED_DIST_LEN[ds]);
+      if (DIST_EXTRA[ds] > 0) bw.writeBits(d - DIST_BASE[ds], DIST_EXTRA[ds]);
     }
   }
-  w.bits(litCodes[256], FIXED_LITLEN[256]);
+  bw.writeBits(reverseBits(litCode[256], FIXED_LIT_LEN[256]), FIXED_LIT_LEN[256]);
 }
 
-function adler32(data: Uint8Array): number {
-  let a = 1;
-  let b = 0;
-  for (let i = 0; i < data.length; ) {
-    const end = Math.min(data.length, i + 5552);
-    for (; i < end; i++) {
-      a += data[i];
-      b += a;
-    }
-    a %= 65521;
-    b %= 65521;
+/**
+ * One DEFLATE block, written into the shared bit stream: parse twice (fixed
+ * costs, then dynamic costs from the first parse), emit the smaller of the
+ * dynamic and fixed forms, or a stored block when neither compresses.
+ */
+function encodeBlockInto(bw: BitWriter, data: Uint8Array, isLast: boolean): void {
+  const { bestLen, bestDist } = findMatches(data);
+  const fixed = costsFromLengths(FIXED_LIT_LEN, FIXED_DIST_LEN);
+  const first = parseBlock(data, bestLen, bestDist, fixed.litCost, fixed.lenCost, fixed.distCostByDist, false);
+  const litLen1 = buildLengths(first.litFreq, 15);
+  const distLen1 = buildLengths(first.distFreq, 15);
+  if (first.distFreq.every((f) => f === 0)) distLen1[0] = 1;
+  const second = costsFromLengths(litLen1, distLen1);
+  const refined = parseBlock(data, bestLen, bestDist, second.litCost, second.lenCost, second.distCostByDist, true);
+  const litLen2 = buildLengths(refined.litFreq, 15);
+  const distLen2 = buildLengths(refined.distFreq, 15);
+  if (refined.distFreq.every((f) => f === 0)) distLen2[0] = 1;
+  // A third parse with the refined costs: the code lengths and the parse
+  // settle toward each other, which is where the remaining points are.
+  const third = costsFromLengths(litLen2, distLen2);
+  const polished = parseBlock(data, bestLen, bestDist, third.litCost, third.lenCost, third.distCostByDist, true);
+  const litLen = buildLengths(polished.litFreq, 15);
+  const distLen = buildLengths(polished.distFreq, 15);
+  if (polished.distFreq.every((f) => f === 0)) distLen[0] = 1;
+
+  const dynWriter = new BitWriter();
+  emitDynamicBlock(dynWriter, isLast, polished, litLen, distLen);
+  const dyn = dynWriter.finish();
+  const fixWriter = new BitWriter();
+  emitFixedBlock(fixWriter, isLast, polished);
+  const fix = fixWriter.finish();
+  const storedLen = data.length + 5 * Math.max(1, Math.ceil(data.length / 65535)) + 1;
+  if (storedLen < dyn.length && storedLen < fix.length) {
+    bw.writeBits(isLast ? 1 : 0, 1);
+    bw.writeBits(0, 2);
+    bw.alignByte();
+    let at = 0;
+    do {
+      const len = Math.min(65535, data.length - at);
+      const lastPiece = at + len >= data.length;
+      bw.bytes.push(lastPiece ? 1 : 0);
+      bw.bytes.push(len & 0xff);
+      bw.bytes.push((len >> 8) & 0xff);
+      bw.bytes.push(~len & 0xff);
+      bw.bytes.push((~len >> 8) & 0xff);
+      for (let i = 0; i < len; i++) bw.bytes.push(data[at + i]);
+      at += len;
+    } while (at < data.length);
+    return;
   }
-  return ((b << 16) | a) >>> 0;
+  if (dyn.length <= fix.length) {
+    emitDynamicBlock(bw, isLast, polished, litLen, distLen);
+  } else {
+    emitFixedBlock(bw, isLast, polished);
+  }
 }
 
-/** Compress `data` to a zlib stream with optimal parsing (200 KB blocks, one refinement pass). */
-function deflateOptimal(data: Uint8Array): Uint8Array {
-  const blockSize = 200000;
-  const { len: mlen, dist: mdist } = findMatches(data);
+const BLOCK_BYTES = 1048576;
+
+/** Raw DEFLATE stream for a filtered image, split into fixed-size blocks. */
+function deflateOptimal(raw: Uint8Array): Uint8Array {
   const bw = new BitWriter();
-  const fixedTables = costTables(FIXED_LITLEN, FIXED_DIST);
-  for (let s = 0; s < data.length; s += blockSize) {
-    const e = Math.min(data.length, s + blockSize);
-    const last = e === data.length;
-    let ops = optimalParse(data, mlen, mdist, s, e, fixedTables.litCost, fixedTables.lenCost, fixedTables.distCost);
-    const { litFreq, distFreq } = frequencies(data, s, ops);
-    const litLens = huffmanLengths(litFreq, 15);
-    const distLens = huffmanLengths(distFreq, 15);
-    const t = costTables(litLens, distLens);
-    // Refinement pass with dynamic costs: here alone, try every match length,
-    // so a match can end exactly where the next good match starts. The first
-    // pass and the fixed-cost comparison stay on the cheap candidate lengths.
-    ops = optimalParse(data, mlen, mdist, s, e, t.litCost, t.lenCost, t.distCost, true);
-    const f2 = frequencies(data, s, ops);
-    const ll2 = huffmanLengths(f2.litFreq, 15);
-    const dl2 = huffmanLengths(f2.distFreq, 15);
-    const fixedOps = optimalParse(data, mlen, mdist, s, e, fixedTables.litCost, fixedTables.lenCost, fixedTables.distCost);
-    const dynCost = ops.cost + 274;
-    const fixedCost = fixedOps.cost + 3;
-    bw.bits(last ? 1 : 0, 1);
-    if (dynCost <= fixedCost) {
-      bw.bits(2, 2);
-      emitDynamic(bw, data, s, ops, ll2, dl2);
-    } else {
-      bw.bits(1, 2);
-      emitFixed(bw, data, s, fixedOps);
-    }
+  let at = 0;
+  while (at < raw.length) {
+    const end = Math.min(raw.length, at + BLOCK_BYTES);
+    encodeBlockInto(bw, raw.subarray(at, end), end >= raw.length);
+    at = end;
   }
-  const deflated = bw.result();
-  const out = new Uint8Array(2 + deflated.length + 4);
-  out[0] = 0x78;
-  out[1] = 0x9c;
-  out.set(deflated, 2);
-  const ad = adler32(data);
-  out[2 + deflated.length] = (ad >>> 24) & 0xff;
-  out[2 + deflated.length + 1] = (ad >>> 16) & 0xff;
-  out[2 + deflated.length + 2] = (ad >>> 8) & 0xff;
-  out[2 + deflated.length + 3] = ad & 0xff;
+  return bw.finish();
+}
+
+// ---------------------------------------------------------------------------
+// PNG encoding
+// ---------------------------------------------------------------------------
+
+function chunkOf(type: string, data: Uint8Array): Uint8Array {
+  const out = new Uint8Array(12 + data.length);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, data.length);
+  for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+  out.set(data, 8);
+  view.setUint32(8 + data.length, crc32(out, 4, 8 + data.length));
+  return out;
+}
+
+function encodePng(width: number, height: number, rep: Reduced, deflated: Uint8Array, filtered: Uint8Array): Uint8Array {
+  const ihdr = new Uint8Array(13);
+  const ihdrView = new DataView(ihdr.buffer);
+  ihdrView.setUint32(0, width);
+  ihdrView.setUint32(4, height);
+  ihdr[8] = 8;
+  ihdr[9] = rep.colourType;
+  const zlib = new Uint8Array(2 + deflated.length + 4);
+  zlib[0] = 0x78;
+  zlib[1] = 0x9c;
+  zlib.set(deflated, 2);
+  new DataView(zlib.buffer).setUint32(2 + deflated.length, adler32(filtered));
+  const chunks: Uint8Array[] = [chunkOf('IHDR', ihdr)];
+  if (rep.palette !== null) chunks.push(chunkOf('PLTE', rep.palette));
+  if (rep.trns !== null) chunks.push(chunkOf('tRNS', rep.trns));
+  chunks.push(chunkOf('IDAT', zlib));
+  chunks.push(chunkOf('IEND', new Uint8Array(0)));
+  let size = 8;
+  for (const c of chunks) size += c.length;
+  const out = new Uint8Array(size);
+  out.set([137, 80, 78, 71, 13, 10, 26, 10], 0);
+  let at = 8;
+  for (const c of chunks) {
+    out.set(c, at);
+    at += c.length;
+  }
   return out;
 }
 
 // ---------------------------------------------------------------------------
-// Entry: screen forms/filters with zlib, write the winner with own deflate.
+// Entry point
 // ---------------------------------------------------------------------------
-const SCREEN = { level: 6, memLevel: 8 };
 
-function chunkBytes(form: Form): number {
-  return (form.plte === null ? 0 : 12 + form.plte.length) + (form.trns === null ? 0 : 12 + form.trns.length);
-}
+const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
+const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-function pngOfForm(width: number, height: number, form: Form, idat: Uint8Array): Uint8Array {
-  const chunks: [string, Uint8Array][] = [['IHDR', ihdrOf(width, height, form.colourType)]];
-  if (form.plte !== null) chunks.push(['PLTE', form.plte]);
-  if (form.trns !== null) chunks.push(['tRNS', form.trns]);
-  chunks.push(['IDAT', idat]);
-  chunks.push(['IEND', new Uint8Array(0)]);
-  return pngOf(chunks);
-}
-
-function encodeImage(rgba: Uint8Array, width: number, height: number): Uint8Array {
-  let best: { form: Form; data: Uint8Array; bytes: number } | null = null;
-  for (const form of formsOf(rgba)) {
-    const chunks = chunkBytes(form);
-    for (const choice of form.filters) {
-      const data = filtered(form.samples, width, height, form.bpp, choice);
-      const zlib = deflateSync(data, SCREEN);
-      const bytes = zlib.length + chunks;
-      if (best === null || bytes < best.bytes) best = { form, data, bytes };
-    }
+function main(): void {
+  const ids = readdirSync(INPUT_DIR)
+    .sort()
+    .filter((id) => /^i\d{3}$/.test(id));
+  for (const id of ids) {
+    const file = readFileSync(join(INPUT_DIR, id, 'image.png'));
+    const { width, height, rgba } = decodePng(new Uint8Array(file));
+    const rep = reduceImage(rgba);
+    const best = screenFilters(rep.samples, width, height, rep.bpp);
+    const own = deflateOptimal(best.raw);
+    // A second candidate for the same filtered stream: the platform zlib at
+    // level 9. Keep whichever raw DEFLATE stream is smaller. (zlib's output
+    // is a zlib stream, so its 2-byte header and 4-byte Adler-32 trailer
+    // are dropped to get the raw DEFLATE stream; the PNG writer adds its
+    // own zlib wrapper and Adler-32.)
+    const zipped = deflateSync(best.raw, { level: 9 });
+    const zraw = zipped.subarray(2, zipped.length - 4);
+    const useZlib = zraw.length < own.length;
+    const deflated = useZlib ? zraw : own;
+    const png = encodePng(width, height, rep, deflated, best.raw);
+    mkdirSync(join(OUTPUT_DIR, id), { recursive: true });
+    writeFileSync(join(OUTPUT_DIR, id, 'image.png'), png);
+    console.log(`${id} type=${rep.colourType} filter=${best.name} encoder=${useZlib ? 'zlib-9' : 'own'} bytes=${png.length}`);
   }
-  const winner = best as { form: Form; data: Uint8Array; bytes: number };
-  const idat = deflateOptimal(winner.data);
-  return pngOfForm(width, height, winner.form, idat);
 }
 
-for (const id of readdirSync(INPUT_DIR).sort()) {
-  const image = decodePng(new Uint8Array(readFileSync(join(INPUT_DIR, id, 'image.png'))));
-  mkdirSync(join(OUTPUT_DIR, id), { recursive: true });
-  writeFileSync(join(OUTPUT_DIR, id, 'image.png'), encodeImage(image.rgba, image.width, image.height));
-}
+main();

@@ -8,23 +8,27 @@ Squeeze 1280×720 RGBA screenshots into the smallest lossless PNG.
 
 ## How it works
 
-1. **Decode** the stored RGBA PNG (own decoder, all five filters).
-2. **Reduce the colour type** per instance: palette (type 3) when the image has
-   at most 256 colours, grey (type 0) for grey images, RGB (type 2) otherwise,
-   RGBA (type 6) when the alpha channel is needed; a `tRNS` key replaces the
-   alpha channel when every non-opaque pixel is fully transparent and shares
-   one colour value.
-3. **Choose filters per row** from a small set of strategies — fixed filter
-   types 0, 1, 2, 4, per-row minimum-sum-of-absolute-signed-bytes, and
-   per-row fewest-distinct-byte-pairs — screened by zlib level 6, picking the
-   smallest total (zlib bytes plus PLTE/tRNS chunk overhead).
-4. **Compress** the filtered data with an own optimal-parsing DEFLATE
-   (hash-chain LZ77, shortest-path parse, dynamic Huffman, in the manner of
-   zopfli): 200 KB blocks, chain cap 32, early exit at match length 128, one
-   refinement pass that tries every match length so a match can end exactly
-   where the next good match starts. Block type (dynamic vs fixed) is chosen
-   by estimated cost. Deterministic: every choice is a function of the input
-   bytes only, budgeted by fixed work counts, never by the wall clock.
+1. **Decode** the stored RGBA PNG (own decoder, all five filters, colour
+   types 0/2/3/4/6 at bit depth 8).
+2. **Reduce the colour type** per instance: grey (type 0) for opaque grey
+   images, grey+alpha (type 4) for grey images with alpha, palette (type 3,
+   most frequent colours first, with `tRNS` where any entry is transparent)
+   when the image holds at most 256 colours, RGB (type 2) when opaque, RGB
+   plus a `tRNS` key when every non-opaque pixel is fully transparent and
+   shares one colour, and RGBA (type 6) otherwise.
+3. **Choose filters** from seven strategies — fixed filter types 0, 1, 2, 3,
+   4, per-row minimum-sum-of-absolute-signed-bytes, and per-row
+   fewest-non-zero-bytes — screened by zlib level 6, picking the smallest.
+4. **Compress** the filtered data twice and keep the smaller raw DEFLATE
+   stream: once with an own optimal-parsing encoder (hash-chain LZ77 with a
+   64-entry chain cap and early exit at match length 128, a three-pass
+   shortest-path parse — fixed costs, then two refinement passes that rebuild
+   the Huffman lengths from the parse — length-limited dynamic Huffman with
+   the standard overflow fix, 1 MiB blocks, dynamic-vs-fixed per block, and
+   a stored fallback), and once with the platform zlib at level 9. Both are
+   Node built-ins; nothing is installed and nothing is read from the network.
+   Deterministic: every choice is a function of the input bytes only,
+   budgeted by fixed work counts, never by the wall clock.
 
 ## Run
 
@@ -40,17 +44,17 @@ override the directories for local runs.
 
 ## Practice-set result
 
-Score **700,426** on the practice set (mean 700.4 per instance), all 8
-outputs pixel-exact, deterministic (two runs byte-identical), ~30 s for the
+Score **708,809** on the practice set (mean 708.8 per instance), all 8
+outputs pixel-exact, deterministic (two runs byte-identical), ~31 s for the
 whole set. House baseline (fixed-Paeth) scores 420,399 on the same set.
 
-| instance | bytes | points |
-|----------|------:|-------:|
-| i001 | 12,653 | 710.6 |
-| i002 | 51,967 | 704.1 |
-| i003 | 102,229 | 701.7 |
-| i004 | 107,559 | 684.5 |
-| i005 | 17,676 | 702.1 |
-| i006 | 175,243 | 702.8 |
-| i007 | 61,700 | 693.5 |
-| i008 | 25,305 | 704.0 |
+| instance | bytes | points | encoder |
+|----------|------:|-------:|---------|
+| i001 | 12,496 | 718.4 | zlib-9 |
+| i002 | 51,852 | 705.5 | zlib-9 |
+| i003 | 102,801 | 698.1 | own |
+| i004 | 107,794 | 683.1 | own |
+| i005 | 16,552 | 742.3 | zlib-9 |
+| i006 | 173,942 | 707.5 | own |
+| i007 | 60,935 | 701.4 | zlib-9 |
+| i008 | 24,897 | 714.2 | zlib-9 |
