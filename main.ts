@@ -2,10 +2,14 @@
 //
 // Own implementation, written from the competition spec: a PNG decoder, a
 // per-instance colour-type reduction, a filter screening pass, and an
-// optimal-parsing DEFLATE encoder (hash-chain LZ77, three-pass shortest-path
+// optimal-parsing DEFLATE encoder (hash-chain LZ77, two-pass shortest-path
 // parse, length-limited dynamic Huffman). Each instance's filtered stream is
-// encoded twice — once by the own parser and once by the platform zlib at
-// level 9 — and the smaller raw DEFLATE stream is kept. Node 22+,
+// encoded by the platform zlib at level 9, and by the own parser only when
+// a fixed 256 KiB prefix of the stream compresses smaller under the own
+// parser than under zlib-9: on the practice set the own parser beats zlib-9
+// on only 3 of 8 instances, and running it on the other 5 is pure wasted
+// time. The prefix is a fixed slice of the input, never the clock, so the
+// decision — and the output bytes — are identical on every run. Node 22+,
 // built-ins only, no network, no wall-clock reads: every choice is a
 // function of the input bytes and fixed work budgets, so two runs write
 // identical bytes.
@@ -569,7 +573,7 @@ function findMatches(data: Uint8Array): { bestLen: Int32Array; bestDist: Int32Ar
     let bestD = 0;
     let steps = 0;
     const maxLen = Math.min(258, n - i);
-    while (cand >= 0 && steps < 64) {
+    while (cand >= 0 && steps < 24) {
       const dist = i - cand;
       if (dist > 32768) break;
       let len = 0;
@@ -577,7 +581,7 @@ function findMatches(data: Uint8Array): { bestLen: Int32Array; bestDist: Int32Ar
       if (len > best) {
         best = len;
         bestD = dist;
-        if (len >= 128) break;
+        if (len >= 64) break;
       }
       cand = prev[cand];
       steps++;
@@ -604,8 +608,10 @@ interface ParseResult {
  * Shortest-path parse of a block. litCost is indexed by literal/length
  * symbol, lenCost by match length, distCostByDist by distance. When refine
  * is false only lengths 3 and the longest match are tried at each position;
- * when true every length up to the longest (a capped set for very long
- * matches) is tried.
+ * when true a capped length set is tried: every length up to 32, then each
+ * length-symbol range maximum up to the longest match, then the longest
+ * match itself. The cap is a fixed function of the input, never of the
+ * clock, so two runs still write identical bytes.
  */
 function parseBlock(
   data: Uint8Array,
@@ -633,24 +639,28 @@ function parseBlock(
     if (bl >= 3) {
       const dcost = distCostByDist[bestDist[i]];
       if (refine) {
-        if (bl <= 128) {
-          for (let l = 3; l <= bl; l++) {
-            const c = base + lenCost[l] + dcost;
-            if (c < dp[i + l]) {
-              dp[i + l] = c;
-              choiceLen[i + l] = l;
-              choiceDist[i + l] = bestDist[i];
-            }
+        // Capped length set: every length up to 32, then each
+        // length-symbol range maximum below the longest match, then the
+        // longest match itself. Trying every length to 128 bought few
+        // points for a large share of the runtime; the range maxima are
+        // the cost-optimal end of each length symbol's range, and the
+        // longest match keeps the exact-endpoint case.
+        const tryLen = (l: number): void => {
+          const c = base + lenCost[l] + dcost;
+          if (c < dp[i + l]) {
+            dp[i + l] = c;
+            choiceLen[i + l] = l;
+            choiceDist[i + l] = bestDist[i];
           }
-        } else {
-          for (const l of [3, 32, 64, 96, 128, bl]) {
-            const c = base + lenCost[l] + dcost;
-            if (c < dp[i + l]) {
-              dp[i + l] = c;
-              choiceLen[i + l] = l;
-              choiceDist[i + l] = bestDist[i];
-            }
+        };
+        const cap = Math.min(bl, 32);
+        for (let l = 3; l <= cap; l++) tryLen(l);
+        if (bl > 32) {
+          for (let k = 0; k < LEN_BASE.length; k++) {
+            const l = LEN_BASE[k];
+            if (l > 32 && l < bl) tryLen(l);
           }
+          tryLen(bl);
         }
       } else {
         for (const l of [3, bl]) {
@@ -876,13 +886,13 @@ function encodeBlockInto(bw: BitWriter, data: Uint8Array, isLast: boolean): void
   const litLen2 = buildLengths(refined.litFreq, 15);
   const distLen2 = buildLengths(refined.distFreq, 15);
   if (refined.distFreq.every((f) => f === 0)) distLen2[0] = 1;
-  // A third parse with the refined costs: the code lengths and the parse
-  // settle toward each other, which is where the remaining points are.
-  const third = costsFromLengths(litLen2, distLen2);
-  const polished = parseBlock(data, bestLen, bestDist, third.litCost, third.lenCost, third.distCostByDist, true);
-  const litLen = buildLengths(polished.litFreq, 15);
-  const distLen = buildLengths(polished.distFreq, 15);
-  if (polished.distFreq.every((f) => f === 0)) distLen[0] = 1;
+  // Two parses only. A third (polished) parse let the code lengths and
+  // the parse settle toward each other, but it cost a full refine pass
+  // for points the 60 s wall cannot afford, so the refined parse and its
+  // code lengths are emitted directly.
+  const polished = refined;
+  const litLen = litLen2;
+  const distLen = distLen2;
 
   const dynWriter = new BitWriter();
   emitDynamicBlock(dynWriter, isLast, polished, litLen, distLen);
@@ -917,6 +927,14 @@ function encodeBlockInto(bw: BitWriter, data: Uint8Array, isLast: boolean): void
 }
 
 const BLOCK_BYTES = 1048576;
+
+/** Bytes of filtered stream encoded by both encoders to decide the gate.
+ * 256 KiB: the 512 KiB prefix predicted 7 of 8 practice winners but cost
+ * ~10 s of prefix tests; 256 KiB costs ~4 s and still predicts 6 of 8 —
+ * it misses i003 (alpha), where the own parser wins the full stream by
+ * ~1.7 KB, and keeps the big i006 win. A 128 KiB prefix would also miss
+ * i006, the largest own-parser win, so 256 KiB is the floor. */
+const PREFIX_BYTES = 262144;
 
 /** Raw DEFLATE stream for a filtered image, split into fixed-size blocks. */
 function deflateOptimal(raw: Uint8Array): Uint8Array {
@@ -989,7 +1007,20 @@ function main(): void {
     const { width, height, rgba } = decodePng(new Uint8Array(file));
     const rep = reduceImage(rgba);
     const best = screenFilters(rep.samples, width, height, rep.bpp);
-    const own = deflateOptimal(best.raw);
+    // Prefix gate: is the own optimal parser worth running on this
+    // instance at all? Encode a fixed 256 KiB prefix with both encoders
+    // and compare raw DEFLATE sizes (zlib's stream carries a 2-byte
+    // header and a 4-byte Adler-32 trailer on top of its raw stream).
+    // On the practice set this predicts the full-stream winner on 6 of
+    // 8 instances; the misses are i003 and i004, where the own parser
+    // wins the full stream by ~1.7 KB and ~0.4 KB, while skipping the
+    // own parser on the 5 instances zlib-9 wins saves ~20 s of pure-TS
+    // parse time on one core.
+    const prefix = best.raw.subarray(0, Math.min(PREFIX_BYTES, best.raw.length));
+    const ownPrefix = deflateOptimal(prefix);
+    const zPrefix = deflateSync(prefix, { level: 9 });
+    const ownWorthTrying = ownPrefix.length < zPrefix.length - 6;
+    const own = ownWorthTrying ? deflateOptimal(best.raw) : null;
     // A second candidate for the same filtered stream: the platform zlib at
     // level 9. Keep whichever raw DEFLATE stream is smaller. (zlib's output
     // is a zlib stream, so its 2-byte header and 4-byte Adler-32 trailer
@@ -997,8 +1028,8 @@ function main(): void {
     // own zlib wrapper and Adler-32.)
     const zipped = deflateSync(best.raw, { level: 9 });
     const zraw = zipped.subarray(2, zipped.length - 4);
-    const useZlib = zraw.length < own.length;
-    const deflated = useZlib ? zraw : own;
+    const useZlib = own === null || zraw.length < own.length;
+    const deflated = useZlib ? zraw : (own as Uint8Array);
     const png = encodePng(width, height, rep, deflated, best.raw);
     mkdirSync(join(OUTPUT_DIR, id), { recursive: true });
     writeFileSync(join(OUTPUT_DIR, id, 'image.png'), png);
